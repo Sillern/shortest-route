@@ -15,29 +15,25 @@ class GMaps:
     def __init__( self ):
         self.db = redis.Redis( 'localhost' )
 
+    def clear_database( self ):
+        self.db.flushall()
 
     def proper_name( self, name, proper_name = None):
         if proper_name:
-            self.db.set( "translate:%s" % ( name ), proper_name )
-            self.db.set( "translate:%s" % ( proper_name ), proper_name )
+            self.db.set( "gmaps:translate:%s" % ( name ), proper_name )
+            self.db.set( "gmaps:translate:%s" % ( proper_name ), proper_name )
 
         else:
-            proper_name = self.db.get( "translate:%s" % ( name ) )
+            proper_name = self.db.get( "gmaps:translate:%s" % ( name ) )
 
         return proper_name
 
     def lookup( self, origin, destination ):
-        origin = self.proper_name( origin )
-        destination = self.proper_name( destination )
-
-        if not origin or not destination:
-            return None, None
-
         origin_id = self.location_id( origin )
         destination_id = self.location_id( destination )
 
-        distance = self.db.get( "distance:%d:%d" % ( origin_id, destination_id ) )
-        duration = self.db.get( "duration:%d:%d" % ( origin_id, destination_id ) )
+        distance = self.db.get( "gmaps:distance:%d:%d" % ( origin_id, destination_id ) )
+        duration = self.db.get( "gmaps:duration:%d:%d" % ( origin_id, destination_id ) )
 
         if not distance or not duration:
             return None, None
@@ -46,34 +42,42 @@ class GMaps:
 
 
     def location_id( self, name ):
-        index = self.db.get( "location:index" )
+        index = self.db.get( "gmaps:location:index" )
         if not index:
-            self.db.set( "location:index", 0 )
+            self.db.set( "gmaps:location:index", 0 )
             index = 0
 
-        location_id = self.db.get( "location:%s" % ( name ) )
+        location_id = self.db.get( "gmaps:location:%s" % ( name ) )
         
         if not location_id:
             location_id = index
-            self.db.set( "location:%s" % ( name ), location_id )
-            self.db.incr( "location:index" )
+            self.db.set( "gmaps:location:%s" % ( name ), location_id )
+            self.db.incr( "gmaps:location:index" )
 
         return int( location_id )
 
 
     def store( self, origin, destination, distance, duration ):
-        origin_id = self.location_id( self.proper_name( origin ) )
-        destination_id = self.location_id( self.proper_name( destination ) )
+        origin_id = self.location_id( origin )
+        destination_id = self.location_id( destination )
 
-        self.db.set( "distance:%d:%d" % ( origin_id, destination_id ), distance )
-        self.db.set( "duration:%d:%d" % ( origin_id, destination_id ), duration )
+        self.db.set( "gmaps:distance:%d:%d" % ( origin_id, destination_id ), distance )
+        self.db.set( "gmaps:duration:%d:%d" % ( origin_id, destination_id ), duration )
+
+        print "stored %s -> %s [%d]" % ( origin, destination, distance )
 
 
     def query( self, origin, destination ):
-        
-        distance, duration = self.lookup( origin, destination )
-        if distance and duration:
-            return distance, duration
+        origin_lookup = self.proper_name( origin )
+        destination_lookup = self.proper_name( destination )
+
+        if origin_lookup and destination_lookup:
+            origin = origin_lookup
+            destination = destination_lookup
+
+            distance, duration = self.lookup( origin, destination )
+            if distance and duration:
+                return distance, duration
 
         query_url = 'http://maps.googleapis.com/maps/api/distancematrix/json?origins=%s&destinations=%s&mode=car&language=en-US&sensor=false' % ( origin, destination )
         response = load_remote_file( query_url )
@@ -109,29 +113,70 @@ def pairwise(iterable):
     next( b, None )
     return list( itertools.izip( a, b ) )
 
+import threading
+
+class compute_distance ( threading.Thread ):
+
+    def __init__( self, gmaps, workload ):
+        self.gmaps = gmaps
+        self.workload = workload
+
+        self.shortest_distance = 0
+        self.shortest_route = []
+        threading.Thread.__init__ ( self )
+
+    def run ( self ):
+        for places in self.workload:
+            route = list( places )
+            route.append( places[0] )
+
+            distance = 0
+            for origin, destination in pairwise( route ):
+                distance += self.gmaps.query( origin, destination )[ 0 ]
+
+            if distance < self.shortest_distance or self.shortest_distance == 0:
+                self.shortest_route = route
+                self.shortest_distance = distance
+
+
 def shortest_route( cities ):
     gmaps = GMaps()
+    #gmaps.clear_database()
 
     shortest_distance = 0
     shortest_route = []
-    for places in list( itertools.permutations( cities, len( cities ) ) ):
-        route = list( places )
-        route.append( places[0] )
+    routes = list( itertools.permutations( cities, len( cities ) ) )
 
-        distance = 0
-        for origin, destination in pairwise( route ):
-            distance += gmaps.query( origin, destination )[ 0 ]
+    number_of_threads = 20
+    workload_size = len( routes ) / number_of_threads
+    workloads = zip( *[iter( routes )] * workload_size )
 
-        if distance < shortest_distance or shortest_distance == 0:
-            shortest_route = route
-            shortest_distance = distance
+    threads = []
+    for workload in workloads:
+        thread = compute_distance( gmaps, workload )
+        thread.start()
+        threads.append( thread )
 
-    return shortest_route, shortest_distance
+    for thread in threads:
+        thread.join()
+        if thread.shortest_distance < shortest_distance or shortest_distance == 0:
+            shortest_route = thread.shortest_route
+            shortest_distance = thread.shortest_distance
+
+    return ( shortest_route, shortest_distance )
+        
 
 cities = [
         "arboga", 
         "karlskrona", 
         "vadstena", 
-        "goteborg"
+        "goteborg",
+        "ornskoldsvik",
+        "smygehuk",
+        "karlstad",
+        "vasteras",
+        "falun",
         ]
-print shortest_route( cities )
+
+route, distance = shortest_route( cities )
+print route, "%d mil" % ( distance / 10000 )
