@@ -113,55 +113,106 @@ def pairwise(iterable):
     next( b, None )
     return list( itertools.izip( a, b ) )
 
-import threading
+from Queue import Queue
+from threading import Thread
 
-class compute_distance ( threading.Thread ):
+class Worker(Thread):
+    """Thread executing tasks from a given tasks queue"""
+    def __init__(self, tasks):
+        Thread.__init__(self)
+        self.tasks = tasks
+        self.result = []
+        self.daemon = True
+        self.start()
+    
+    def run(self):
+        while True:
+            func, args, kargs = self.tasks.get()
+            try: 
+                self.result.append( func(*args, **kargs) )
+            except Exception, e: 
+                print e
+            self.tasks.task_done()
 
-    def __init__( self, gmaps, workload ):
-        self.gmaps = gmaps
-        self.workload = workload
+class ThreadPool:
+    """Pool of threads consuming tasks from a queue"""
+    def __init__(self, num_threads):
+        self.tasks = Queue(num_threads)
+        self.workers = []
+        for _ in range(num_threads): 
+            self.workers.append( Worker(self.tasks) )
 
-        self.shortest_distance = 0
-        self.shortest_route = []
-        threading.Thread.__init__ ( self )
+    def add_task(self, func, *args, **kargs):
+        """Add a task to the queue"""
+        self.tasks.put((func, args, kargs))
 
-    def run ( self ):
-        for places in self.workload:
-            route = list( places )
-            route.append( places[0] )
+    def wait_completion(self):
+        """Wait for completion of all the tasks in the queue"""
+        self.tasks.join()
+        result = []
+        for worker in self.workers:
+            result.extend( worker.result )
+        return result
 
-            distance = 0
-            for origin, destination in pairwise( route ):
-                distance += self.gmaps.query( origin, destination )[ 0 ]
 
-            if distance < self.shortest_distance or self.shortest_distance == 0:
-                self.shortest_route = route
-                self.shortest_distance = distance
+def compute_routes( gmaps, workload ):
+    shortest_distance = 0
+    shortest_route = []
+    
+    for places in workload:
+        route = list( places )
+        route.append( places[0] )
 
+        distance = 0
+        for origin, destination in pairwise( route ):
+            distance += gmaps.query( origin, destination )[ 0 ]
+
+        if distance < shortest_distance or shortest_distance == 0:
+            shortest_route = route
+            shortest_distance = distance
+
+    return shortest_route, distance
+
+
+import sys
+def report_progress( index = 0, length = 0 ):
+    if index == 0 or length == 0:
+        sys.stdout.write( "\r\n" )
+        sys.stdout.flush()
+        return
+
+    progress = "Progress: %.2f%c" % ( ( float( index )/float( length ) )*100.0, "%" )
+    sys.stdout.write( "\r%s" % progress )
+    sys.stdout.flush()
 
 def shortest_route( cities ):
     gmaps = GMaps()
     #gmaps.clear_database()
 
-    shortest_distance = 0
-    shortest_route = []
     routes = list( itertools.permutations( cities, len( cities ) ) )
 
-    number_of_threads = 20
-    workload_size = len( routes ) / number_of_threads
+    workload_size = 100
     workloads = zip( *[iter( routes )] * workload_size )
+    print "Each thread will go through %d routes" % ( workload_size )
 
-    threads = []
-    for workload in workloads:
-        thread = compute_distance( gmaps, workload )
-        thread.start()
-        threads.append( thread )
+    number_of_threads = 4
 
-    for thread in threads:
-        thread.join()
-        if thread.shortest_distance < shortest_distance or shortest_distance == 0:
-            shortest_route = thread.shortest_route
-            shortest_distance = thread.shortest_distance
+    pool = ThreadPool( number_of_threads )
+    
+    for index, workload in enumerate( workloads ):
+        report_progress( index, len( workloads ) )
+
+        pool.add_task( compute_routes, gmaps, workload)
+    report_progress()
+    
+    results = pool.wait_completion()
+
+    shortest_distance = 0
+    shortest_route = []
+    for route, distance in results:
+        if distance < shortest_distance or shortest_distance == 0:
+            shortest_route = route
+            shortest_distance = distance
 
     return ( shortest_route, shortest_distance )
         
